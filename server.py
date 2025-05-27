@@ -1,88 +1,144 @@
-from flask import Flask, request, jsonify, render_template_string
-from flask_cors import CORS
-import requests
-import os
-
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
-
-# Base API URL
-API_BASE_URL = "https://terabox.hnn.workers.dev"
-
-# HTML template for dynamically generated streaming pages
-STREAM_PAGE_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="robots" content="noindex,nofollow">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/video.js/8.8.0/video-js.min.css">
-    <link rel="stylesheet" href="/style.css">
-    <title>{{ file_name }} - Streaming</title>
-</head>
-<body>
-    <div class="container">
-        <h1 id="name">{{ file_name }}</h1>
-        <video id="player" class="video-js vjs-default-skin vjs-big-play-centered" controls></video>
-        <div class="form-group">
-            <button id="get-link-button">DOWNLOAD</button>
-        </div>
-    </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/video.js/8.8.0/video.min.js"></script>
-    <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            const shortUrl = "{{ short_url }}";
-            const TeraBoxData = JSON.parse(localStorage.getItem('TeraBoxData')) || [];
-            const matchedItem = TeraBoxData.find(item => item.shortUrl === shortUrl);
-            const downloadLink = matchedItem ? matchedItem.downloadLink : '';
-
-            if (downloadLink) {
-                const player = videojs(document.getElementById('player'));
-                player.src({ src: downloadLink, type: 'video/mp4' });
-            }
-
-            document.getElementById("get-link-button").addEventListener("click", function() {
-                if (downloadLink) window.open(downloadLink, '_blank');
-            });
-        });
-    </script>
-</body>
-</html>
+"""
+Universal Share - P2P File Sharing Backend
+Creator: Aniket Mujbaile
 """
 
-@app.route('/proxy', methods=['GET', 'POST'])
-def proxy():
-    """Proxy API requests to bypass CORS"""
-    target_url = request.args.get('url')  # Extract API path
-    if not target_url:
-        return jsonify({"error": "Missing 'url' parameter"}), 400
+from flask import Flask, request, jsonify, abort, send_from_directory
+from flask_cors import CORS
+import threading
+import os
+import tempfile
+import uuid
+from flask import send_file
 
-    query_params = request.query_string.decode('utf-8').replace(f"url={target_url}&", "")  # Remove 'url' param
-    full_url = f"{API_BASE_URL}{target_url}"
-    if query_params:
-        full_url += f"?{query_params}"
+app = Flask(__name__)
+CORS(app)
 
-    print(f"[DEBUG] Forwarding request to: {full_url}")
+# In-memory storage for signaling data
+sessions = {}
+lock = threading.Lock()
 
-    try:
-        headers = {"Content-Type": "application/json"}
-        if request.method == 'GET':
-            response = requests.get(full_url, headers=headers)
-        else:
-            response = requests.post(full_url, json=request.json, headers=headers)
+# Temporary file storage
+UPLOAD_FOLDER = tempfile.mkdtemp()
+file_map = {}  # Maps file_id to file path
 
-        print(f"[DEBUG] Response Status: {response.status_code}")
-        return (response.text, response.status_code, {"Content-Type": response.headers.get("Content-Type", "application/json")})
+def get_session(share_id):
+    with lock:
+        if share_id not in sessions:
+            sessions[share_id] = {
+                'offer': None,
+                'answer': None,
+                'candidates': []
+            }
+        return sessions[share_id]
 
-    except requests.exceptions.RequestException as e:
-        print(f"[ERROR] Request Failed: {e}")
-        return jsonify({"error": str(e)}), 500
+def validate_json(required_keys):
+    data = request.json
+    if not data:
+        abort(400, description="Missing JSON body.")
+    for key in required_keys:
+        if key not in data:
+            abort(400, description=f"Missing required field: {key}")
+    return data
 
-@app.route('/w/<short_url>.html')
-def serve_streaming_page(short_url):
-    """Dynamically generate and serve the streaming page."""
-    return render_template_string(STREAM_PAGE_TEMPLATE, short_url=short_url, file_name="TeraBox Video")
+@app.route('/offer', methods=['POST'])
+def offer():
+    data = validate_json(['id'])
+    share_id = data['id']
+    sdp = data.get('sdp')
+    session = get_session(share_id)
+    if sdp:
+        session['offer'] = sdp
+        return jsonify({'ok': True}), 200
+    if session['offer']:
+        return jsonify({'sdp': session['offer']}), 200
+    return jsonify({'error': 'No offer found'}), 404
+
+@app.route('/answer', methods=['POST'])
+def answer():
+    data = validate_json(['id'])
+    share_id = data['id']
+    sdp = data.get('sdp')
+    session = get_session(share_id)
+    if sdp:
+        session['answer'] = sdp
+        return jsonify({'ok': True}), 200
+    if session['answer']:
+        return jsonify({'sdp': session['answer']}), 200
+    return jsonify({'error': 'No answer found'}), 404
+
+@app.route('/candidate', methods=['POST'])
+def candidate():
+    data = validate_json(['id'])
+    share_id = data['id']
+    candidate = data.get('candidate')
+    session = get_session(share_id)
+    if candidate:
+        session['candidates'].append(candidate)
+        return jsonify({'ok': True}), 200
+    # Return and clear all candidates as a list
+    candidates = session['candidates'][:]
+    session['candidates'].clear()
+    return jsonify({'candidates': candidates}), 200
+
+@app.route('/reset', methods=['POST'])
+def reset():
+    """Reset all sessions (for debugging or manual cleanup)."""
+    global sessions
+    with lock:
+        sessions = {}
+    return jsonify({'ok': True})
+
+@app.route('/session/<share_id>', methods=['GET'])
+def session_info(share_id):
+    """Get the current state of a session (for debugging)."""
+    session = get_session(share_id)
+    return jsonify(session)
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    if 'file' not in request.files:
+        abort(400, description="No file part in the request.")
+    file = request.files['file']
+    if file.filename == '':
+        abort(400, description="No selected file.")
+    file_id = str(uuid.uuid4())
+    file_path = os.path.join(UPLOAD_FOLDER, file_id + '_' + file.filename)
+    file.save(file_path)
+    file_map[file_id] = file_path
+    download_url = request.host_url.rstrip('/') + f"/download/{file_id}"
+    return jsonify({'download_url': download_url, 'file_id': file_id}), 200
+
+@app.route('/download/<file_id>', methods=['GET'])
+def download(file_id):
+    file_path = file_map.get(file_id)
+    if not file_path or not os.path.exists(file_path):
+        abort(404, description="File not found or expired.")
+    # Serve the file for download
+    filename = os.path.basename(file_path).split('_', 1)[-1]
+    response = send_file(file_path, as_attachment=True, download_name=filename)
+    # Optionally, delete file after download (uncomment next two lines for one-time download)
+    # os.remove(file_path)
+    # file_map.pop(file_id, None)
+    return response
+
+@app.route('/url/<file_id>', methods=['GET'])
+def get_download_url(file_id):
+    """Return the direct download URL for a given file_id if it exists."""
+    file_path = file_map.get(file_id)
+    if not file_path or not os.path.exists(file_path):
+        abort(404, description="File not found or expired.")
+    download_url = request.host_url.rstrip('/') + f"/download/{file_id}"
+    return jsonify({'download_url': download_url}), 200
+
+@app.route('/')
+def root():
+    return send_from_directory('.', 'index.html')
+
+@app.route('/<path:path>')
+def static_proxy(path):
+    # Serve static files (js, css, etc.) from the root directory
+    return send_from_directory('.', path)
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
